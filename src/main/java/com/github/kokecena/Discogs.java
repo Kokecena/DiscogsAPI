@@ -11,6 +11,11 @@ import org.slf4j.LoggerFactory;
 import retrofit2.Retrofit;
 import retrofit2.converter.jackson.JacksonConverterFactory;
 
+import javax.net.ssl.*;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -102,6 +107,8 @@ public class Discogs {
      */
     private Retrofit buildRetrofitService(String userAgent, String consumerKey, String consumerSecret, String accessToken) {
         boolean notHasKeys = (consumerKey == null || consumerKey.isBlank() || consumerSecret == null || consumerSecret.isBlank()) && (accessToken == null || accessToken.isBlank());
+        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor(log::info);
+        loggingInterceptor.setLevel(HttpLoggingInterceptor.Level.BODY);
         Interceptor interceptorDelay = chain -> {
             try {
                 TimeUnit.MILLISECONDS.sleep(notHasKeys ? 2400L : 1000L);
@@ -110,42 +117,47 @@ public class Discogs {
             }
             return chain.proceed(chain.request());
         };
-        HttpLoggingInterceptor loggingInterceptor = new HttpLoggingInterceptor(log::debug);
-        loggingInterceptor.setLevel(HttpLoggingInterceptor.Level.HEADERS);
-        OkHttpClient okHttpClient;
+        Interceptor interceptorHeaders;
         if (notHasKeys) {
-            okHttpClient = new OkHttpClient.Builder()
-                    .addInterceptor(chain -> {
-                        Request request = chain.request();
-                        Request requestWithUserAgent = request.newBuilder()
-                                .addHeader("User-Agent", userAgent)
-                                .method(request.method(), request.body())
-                                .build();
-                        return chain.proceed(requestWithUserAgent);
-                    })
-                    .addInterceptor(loggingInterceptor).build();
+            interceptorHeaders = chain -> {
+                Request request = chain.request();
+                Request requestWithUserAgent = request.newBuilder()
+                        .addHeader("User-Agent", userAgent)
+                        .method(request.method(), request.body())
+                        .build();
+                return chain.proceed(requestWithUserAgent);
+            };
         } else {
             loggingInterceptor.redactHeader("Authorization");
             String authorization = accessToken != null ? String.format("Discogs token=%s", accessToken) :
                     String.format("Discogs key=%s, secret=%s", consumerKey, consumerSecret);
-            okHttpClient = new OkHttpClient.Builder()
-                    .addNetworkInterceptor(interceptorDelay)
-                    .addInterceptor(chain -> {
-                        Request request = chain.request();
-                        Request requestWithUserAgent = request.newBuilder()
-                                .addHeader("User-Agent", userAgent)
-                                .addHeader("Authorization", authorization)
-                                .method(request.method(), request.body())
-                                .build();
-                        return chain.proceed(requestWithUserAgent);
-                    })
-                    .addInterceptor(loggingInterceptor).build();
+            interceptorHeaders = chain -> {
+                Request request = chain.request();
+                Request requestWithUserAgent = request.newBuilder()
+                        .addHeader("User-Agent", userAgent)
+                        .addHeader("Authorization", authorization)
+                        .method(request.method(), request.body())
+                        .build();
+                return chain.proceed(requestWithUserAgent);
+            };
+        }
+        OkHttpClient.Builder okHttpClient = new OkHttpClient.Builder()
+                .addNetworkInterceptor(interceptorDelay)
+                .addInterceptor(interceptorHeaders);
+        try {
+            TrustManager[] trustAllCerts = {new X509Manager()};
+            SSLContext sslContext = SSLContext.getInstance("SSL");
+            sslContext.init(null, trustAllCerts, new SecureRandom());
+            okHttpClient.sslSocketFactory(sslContext.getSocketFactory(), new X509Manager())
+                    .hostnameVerifier((hostName, sslSession) -> true);
+        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+            log.error("{}", e.getMessage(), e);
         }
         return new Retrofit.Builder()
                 .baseUrl(BASE_URL)
                 .addConverterFactory(JacksonConverterFactory.create())
                 .addCallAdapterFactory(ReactorCallAdapterFactory.create())
-                .client(okHttpClient)
+                .client(okHttpClient.build())
                 .build();
     }
 
@@ -158,4 +170,19 @@ public class Discogs {
         return retrofit.create(DatabaseService.class);
     }
 
+
+    private class X509Manager implements X509TrustManager {
+        @Override
+        public void checkClientTrusted(X509Certificate[] x509Certificates, String s) {
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] x509Certificates, String s) {
+        }
+
+        @Override
+        public X509Certificate[] getAcceptedIssuers() {
+            return new X509Certificate[]{};
+        }
+    }
 }
